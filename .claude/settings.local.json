@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(pip3 install *)",
+      "Bash(python3 -c \"import alpaca\")",
+      "Bash(python3 -m pip install alpaca-py pandas numpy apscheduler -q)",
+      "Bash(python3 tdi_trader.py --now)"
+    ]
+  }
+}
