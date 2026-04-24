@@ -1,0 +1,5 @@
+alpaca-py
+pandas
+numpy
+apscheduler
+pytz
