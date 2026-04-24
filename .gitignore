@@ -1,3 +1,4 @@
 config.json
 tdi_trader.log
 *.pid
+.claude/settings.local.json
