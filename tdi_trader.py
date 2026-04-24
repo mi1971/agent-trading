@@ -375,16 +375,16 @@ def main():
     run_strategy(cfg)
 
     scheduler = BlockingScheduler(timezone=ZoneInfo("America/New_York"))
-    # 4-hour bars: fire at 9:30, 13:30, 17:30 ET (covers market open & midday)
-    scheduler.add_job(
-        lambda: run_strategy(load_config()),  # reload config each run
-        "cron",
-        day_of_week="mon-fri",
-        hour="9,13,17",
-        minute="30",
-    )
+    for hour, minute in [(9, 30), (13, 0), (15, 50)]:
+        scheduler.add_job(
+            lambda: run_strategy(load_config()),
+            "cron",
+            day_of_week="mon-fri",
+            hour=hour,
+            minute=minute,
+        )
 
-    log.info("Scheduler started — firing at 9:30, 13:30, 17:30 ET on weekdays.")
+    log.info("Scheduler started — firing at 9:30, 13:00, 15:50 ET on weekdays.")
     log.info("Press Ctrl+C to stop.\n")
 
     try:
