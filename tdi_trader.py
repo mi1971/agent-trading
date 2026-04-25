@@ -177,35 +177,67 @@ def get_clients(cfg):
 
 
 def fetch_bars(data_client, symbol: str, bars: int = BARS_NEEDED) -> pd.DataFrame:
-    """Fetch 1H bars via IEX and resample to 4H.
-    IEX free feed doesn't reliably serve 4H bars natively, so we
-    build them ourselves from hourly data."""
+    """Fetch 1H bars via Alpaca/IEX (resample to 4H), with yfinance fallback."""
     end   = datetime.now(timezone.utc)
-    # 1H bars needed: bars * 4H each, market open ~6.5H/day → generous buffer
     start = end - timedelta(days=int(bars * 4 / 6.5) + 45)
 
-    req = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Hour,
-        start=start,
-        end=end,
-        feed="iex",
-    )
-    barset = data_client.get_stock_bars(req)
-    df = barset.df
+    try:
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Hour,
+            start=start,
+            end=end,
+            feed="iex",
+        )
+        barset = data_client.get_stock_bars(req)
+        df = barset.df
 
+        if df.empty:
+            raise ValueError("Empty response from Alpaca")
+
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(symbol, level="symbol")
+
+        df = df[["open", "high", "low", "close", "volume"]].copy()
+        df.index = pd.to_datetime(df.index, utc=True)
+        df.sort_index(inplace=True)
+
+        df_4h = df.resample("4h").agg({
+            "open":   "first",
+            "high":   "max",
+            "low":    "min",
+            "close":  "last",
+            "volume": "sum",
+        }).dropna(subset=["close"])
+
+        return df_4h.tail(bars)
+
+    except Exception as alpaca_err:
+        log.warning(f"  Alpaca data unavailable ({alpaca_err}) — falling back to yfinance")
+        return _fetch_bars_yfinance(symbol, bars)
+
+
+def _fetch_bars_yfinance(symbol: str, bars: int = BARS_NEEDED) -> pd.DataFrame:
+    """Fetch 1H bars from yfinance and resample to 4H (fallback)."""
+    try:
+        import yfinance as yf
+    except ImportError:
+        log.error("yfinance not installed — run: pip install yfinance")
+        return pd.DataFrame()
+
+    # yfinance 1h data limited to ~730 days; fetch 60-day window (generous for 150 4H bars)
+    df = yf.download(symbol, period="60d", interval="1h", auto_adjust=True, progress=False)
     if df.empty:
         return df
+    # flatten MultiIndex columns if present (yfinance sometimes returns (field, ticker))
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-    # Flatten multi-index if present
-    if isinstance(df.index, pd.MultiIndex):
-        df = df.xs(symbol, level="symbol")
-
-    df = df[["open", "high", "low", "close", "volume"]].copy()
     df.index = pd.to_datetime(df.index, utc=True)
+    df.columns = [c.lower() for c in df.columns]
+    df = df[["open", "high", "low", "close", "volume"]].copy()
     df.sort_index(inplace=True)
 
-    # Resample 1H → 4H
     df_4h = df.resample("4h").agg({
         "open":   "first",
         "high":   "max",
@@ -259,20 +291,28 @@ def run_strategy(cfg):
     watchlist    = cfg.get("watchlist", ["SPY"])
     trade_amount = float(cfg.get("trade_amount", 500))
     paper        = cfg.get("paper", True)
+    summary_rows = []  # collect per-symbol results for the final table
 
     trading_client, data_client = get_clients(cfg)
 
     # Check market hours (bypass with --now flag for testing)
-    if not market_open(trading_client) and not getattr(run_strategy, "_force", False):
+    # NOTE: _force check must come first to avoid calling market_open() unnecessarily
+    if not getattr(run_strategy, "_force", False) and not market_open(trading_client):
         log.info("Market is closed — skipping this cycle.")
         return
 
-    account = trading_client.get_account()
-    log.info(
-        f"Account | Equity: ${float(account.equity):,.2f} | "
-        f"Buying Power: ${float(account.buying_power):,.2f} | "
-        f"Mode: {'PAPER' if paper else 'LIVE'}"
-    )
+    trading_available = True
+    try:
+        account = trading_client.get_account()
+        log.info(
+            f"Account | Equity: ${float(account.equity):,.2f} | "
+            f"Buying Power: ${float(account.buying_power):,.2f} | "
+            f"Mode: {'PAPER' if paper else 'LIVE'}"
+        )
+    except Exception as e:
+        trading_available = False
+        account = None
+        log.warning(f"Trading API unavailable ({e}) — signals only, no orders will be placed.")
 
     for symbol in watchlist:
         log.info(f"\n── {symbol} ──────────────────────────────")
@@ -281,6 +321,7 @@ def run_strategy(cfg):
         df = fetch_bars(data_client, symbol)
         if df.empty or len(df) < BAND_LENGTH + RSI_PERIOD:
             log.warning(f"  Not enough bars for {symbol} — skipping.")
+            summary_rows.append({"Ticker": symbol, "RSI": "N/A", "FastMA": "N/A", "SlowMA": "N/A", "Signal": "SKIP", "Order": "—"})
             continue
 
         # 2. Calculate TDI
@@ -302,9 +343,10 @@ def run_strategy(cfg):
         buy_sig  = bool(latest["buy_signal"])
         sell_sig = bool(latest["sell_signal"])
         log.info(f"  Signal | BUY: {buy_sig} | SELL: {sell_sig}")
+        order_placed = "—"
 
         # 3. Check current position
-        position = get_position(trading_client, symbol)
+        position = get_position(trading_client, symbol) if trading_available else None
         qty = float(position.qty) if position else 0.0
         has_long = qty > 0   # only count actual long positions, not accidental shorts
         log.info(
@@ -318,13 +360,17 @@ def run_strategy(cfg):
             continue
 
         # 4. Execute trades
-        if buy_sig and not has_long:
+        if not trading_available:
+            log.info(f"  Trading API offline — skipping order execution")
+        elif buy_sig and not has_long:
             # Verify we have buying power
             if float(account.buying_power) >= trade_amount:
                 log.info(f"  🟢 BUY signal confirmed — placing ${trade_amount:,.0f} order")
                 place_order(trading_client, symbol, OrderSide.BUY, trade_amount)
+                order_placed = f"BUY ${trade_amount:,.0f}"
             else:
                 log.warning(f"  Insufficient buying power (${float(account.buying_power):,.2f}) — skipping buy")
+                order_placed = "BUY (insuff. funds)"
 
         elif sell_sig and has_long:
             # Don't sell more than we hold
@@ -332,6 +378,7 @@ def run_strategy(cfg):
             sell_notional = min(trade_amount, pos_value)
             log.info(f"  🔴 SELL signal confirmed — placing ${sell_notional:,.0f} order")
             place_order(trading_client, symbol, OrderSide.SELL, sell_notional)
+            order_placed = f"SELL ${sell_notional:,.0f}"
 
         elif buy_sig and has_long:
             log.info(f"  BUY signal but already have a position — holding")
@@ -342,7 +389,32 @@ def run_strategy(cfg):
         else:
             log.info(f"  No signal — holding")
 
+        sig_label = "BUY" if buy_sig else ("SELL" if sell_sig else "HOLD")
+        summary_rows.append({
+            "Ticker":  symbol,
+            "RSI":     f"{latest['rsi']:.1f}",
+            "FastMA":  f"{latest['fast_ma']:.1f}",
+            "SlowMA":  f"{latest['slow_ma']:.1f}",
+            "Signal":  sig_label,
+            "Order":   order_placed,
+        })
+
         time.sleep(0.3)  # gentle rate limiting between symbols
+
+    # ── Summary table ──────────────────────────────
+    if summary_rows:
+        col_w = {"Ticker": 6, "RSI": 6, "FastMA": 7, "SlowMA": 7, "Signal": 6, "Order": 22}
+        header = "  ".join(k.ljust(v) for k, v in col_w.items())
+        sep    = "  ".join("-" * v for v in col_w.values())
+        log.info("\n" + "=" * len(sep))
+        log.info("SUMMARY TABLE")
+        log.info(sep)
+        log.info(header)
+        log.info(sep)
+        for row in summary_rows:
+            line = "  ".join(str(row[k]).ljust(v) for k, v in col_w.items())
+            log.info(line)
+        log.info(sep)
 
     log.info(f"\nCycle complete.\n")
 
