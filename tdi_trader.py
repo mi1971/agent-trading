@@ -176,36 +176,18 @@ def get_clients(cfg):
     return trading, data
 
 
-def fetch_bars(data_client, symbol: str, bars: int = BARS_NEEDED) -> pd.DataFrame:
-    """Fetch 1H bars via IEX and resample to 4H.
-    IEX free feed doesn't reliably serve 4H bars natively, so we
-    build them ourselves from hourly data."""
-    end   = datetime.now(timezone.utc)
-    # 1H bars needed: bars * 4H each, market open ~6.5H/day → generous buffer
-    start = end - timedelta(days=int(bars * 4 / 6.5) + 45)
-
-    req = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Hour,
-        start=start,
-        end=end,
-        feed="iex",
-    )
-    barset = data_client.get_stock_bars(req)
-    df = barset.df
-
+def _fetch_bars_yfinance(symbol: str, bars: int) -> pd.DataFrame:
+    """Fallback: fetch 1H bars from Yahoo Finance and resample to 4H."""
+    import yfinance as yf
+    # yfinance 1h data goes back ~60 days; fetch max available
+    ticker = yf.Ticker(symbol)
+    df = ticker.history(period="60d", interval="1h", auto_adjust=True)
     if df.empty:
         return df
-
-    # Flatten multi-index if present
-    if isinstance(df.index, pd.MultiIndex):
-        df = df.xs(symbol, level="symbol")
-
-    df = df[["open", "high", "low", "close", "volume"]].copy()
     df.index = pd.to_datetime(df.index, utc=True)
+    df.columns = [c.lower() for c in df.columns]
+    df = df[["open", "high", "low", "close", "volume"]].copy()
     df.sort_index(inplace=True)
-
-    # Resample 1H → 4H
     df_4h = df.resample("4h").agg({
         "open":   "first",
         "high":   "max",
@@ -213,8 +195,49 @@ def fetch_bars(data_client, symbol: str, bars: int = BARS_NEEDED) -> pd.DataFram
         "close":  "last",
         "volume": "sum",
     }).dropna(subset=["close"])
-
     return df_4h.tail(bars)
+
+
+def fetch_bars(data_client, symbol: str, bars: int = BARS_NEEDED) -> pd.DataFrame:
+    """Fetch 1H bars via IEX and resample to 4H.
+    Falls back to yfinance if Alpaca data is unavailable (e.g. IP allowlist)."""
+    end   = datetime.now(timezone.utc)
+    start = end - timedelta(days=int(bars * 4 / 6.5) + 45)
+
+    try:
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Hour,
+            start=start,
+            end=end,
+            feed="iex",
+        )
+        barset = data_client.get_stock_bars(req)
+        df = barset.df
+
+        if df.empty:
+            raise ValueError("Empty response from Alpaca")
+
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(symbol, level="symbol")
+
+        df = df[["open", "high", "low", "close", "volume"]].copy()
+        df.index = pd.to_datetime(df.index, utc=True)
+        df.sort_index(inplace=True)
+
+        df_4h = df.resample("4h").agg({
+            "open":   "first",
+            "high":   "max",
+            "low":    "min",
+            "close":  "last",
+            "volume": "sum",
+        }).dropna(subset=["close"])
+
+        return df_4h.tail(bars)
+
+    except Exception as e:
+        log.warning(f"  Alpaca data unavailable ({e}) — falling back to yfinance")
+        return _fetch_bars_yfinance(symbol, bars)
 
 
 def get_position(trading_client, symbol: str):
@@ -263,16 +286,21 @@ def run_strategy(cfg):
     trading_client, data_client = get_clients(cfg)
 
     # Check market hours (bypass with --now flag for testing)
-    if not market_open(trading_client) and not getattr(run_strategy, "_force", False):
+    # NOTE: _force check must come first to avoid calling market_open() when bypassing
+    if not getattr(run_strategy, "_force", False) and not market_open(trading_client):
         log.info("Market is closed — skipping this cycle.")
         return
 
-    account = trading_client.get_account()
-    log.info(
-        f"Account | Equity: ${float(account.equity):,.2f} | "
-        f"Buying Power: ${float(account.buying_power):,.2f} | "
-        f"Mode: {'PAPER' if paper else 'LIVE'}"
-    )
+    try:
+        account = trading_client.get_account()
+        log.info(
+            f"Account | Equity: ${float(account.equity):,.2f} | "
+            f"Buying Power: ${float(account.buying_power):,.2f} | "
+            f"Mode: {'PAPER' if paper else 'LIVE'}"
+        )
+    except Exception as e:
+        log.warning(f"Could not fetch account info ({e}) — running in signal-only mode (no orders)")
+        account = None
 
     for symbol in watchlist:
         log.info(f"\n── {symbol} ──────────────────────────────")
@@ -317,8 +345,10 @@ def run_strategy(cfg):
             log.warning(f"  Short position detected on {symbol} — please close manually in Alpaca dashboard.")
             continue
 
-        # 4. Execute trades
-        if buy_sig and not has_long:
+        # 4. Execute trades (skipped if account info unavailable)
+        if account is None:
+            log.info(f"  Signal-only mode — no order placed")
+        elif buy_sig and not has_long:
             # Verify we have buying power
             if float(account.buying_power) >= trade_amount:
                 log.info(f"  🟢 BUY signal confirmed — placing ${trade_amount:,.0f} order")
