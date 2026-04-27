@@ -263,7 +263,7 @@ def run_strategy(cfg):
     trading_client, data_client = get_clients(cfg)
 
     # Check market hours (bypass with --now flag for testing)
-    if not market_open(trading_client) and not getattr(run_strategy, "_force", False):
+    if not getattr(run_strategy, "_force", False) and not market_open(trading_client):
         log.info("Market is closed — skipping this cycle.")
         return
 
