@@ -177,44 +177,65 @@ def get_clients(cfg):
 
 
 def fetch_bars(data_client, symbol: str, bars: int = BARS_NEEDED) -> pd.DataFrame:
-    """Fetch 1H bars via IEX and resample to 4H.
-    IEX free feed doesn't reliably serve 4H bars natively, so we
-    build them ourselves from hourly data."""
+    """Fetch 1H bars and resample to 4H.
+    Tries Alpaca/IEX first; falls back to yfinance if Alpaca is unreachable."""
     end   = datetime.now(timezone.utc)
-    # 1H bars needed: bars * 4H each, market open ~6.5H/day → generous buffer
     start = end - timedelta(days=int(bars * 4 / 6.5) + 45)
 
-    req = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Hour,
-        start=start,
-        end=end,
-        feed="iex",
-    )
-    barset = data_client.get_stock_bars(req)
-    df = barset.df
+    # ── Alpaca attempt ────────────────────────────────────────────────────
+    try:
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Hour,
+            start=start,
+            end=end,
+            feed="iex",
+        )
+        barset = data_client.get_stock_bars(req)
+        df = barset.df
 
-    if df.empty:
-        return df
+        if not df.empty:
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.xs(symbol, level="symbol")
+            df = df[["open", "high", "low", "close", "volume"]].copy()
+            df.index = pd.to_datetime(df.index, utc=True)
+            df.sort_index(inplace=True)
+            df_4h = df.resample("4h").agg({
+                "open":   "first",
+                "high":   "max",
+                "low":    "min",
+                "close":  "last",
+                "volume": "sum",
+            }).dropna(subset=["close"])
+            return df_4h.tail(bars)
+    except Exception as e:
+        log.warning(f"  Alpaca data unavailable ({e}); falling back to yfinance")
 
-    # Flatten multi-index if present
-    if isinstance(df.index, pd.MultiIndex):
-        df = df.xs(symbol, level="symbol")
-
-    df = df[["open", "high", "low", "close", "volume"]].copy()
-    df.index = pd.to_datetime(df.index, utc=True)
-    df.sort_index(inplace=True)
-
-    # Resample 1H → 4H
-    df_4h = df.resample("4h").agg({
-        "open":   "first",
-        "high":   "max",
-        "low":    "min",
-        "close":  "last",
-        "volume": "sum",
-    }).dropna(subset=["close"])
-
-    return df_4h.tail(bars)
+    # ── yfinance fallback ─────────────────────────────────────────────────
+    try:
+        import yfinance as yf
+        # Fetch 60d of 1H data (yfinance limit for intraday)
+        raw = yf.download(symbol, period="60d", interval="1h", progress=False, auto_adjust=True)
+        if raw.empty:
+            return pd.DataFrame()
+        # Flatten MultiIndex columns if present
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = [c[0].lower() for c in raw.columns]
+        else:
+            raw.columns = [c.lower() for c in raw.columns]
+        raw.index = pd.to_datetime(raw.index, utc=True)
+        raw.sort_index(inplace=True)
+        df_4h = raw[["open", "high", "low", "close", "volume"]].resample("4h").agg({
+            "open":   "first",
+            "high":   "max",
+            "low":    "min",
+            "close":  "last",
+            "volume": "sum",
+        }).dropna(subset=["close"])
+        return df_4h.tail(bars)
+    except Exception as e:
+        log.error(f"  yfinance also failed for {symbol}: {e}")
+        return pd.DataFrame()
 
 
 def get_position(trading_client, symbol: str):
@@ -263,16 +284,21 @@ def run_strategy(cfg):
     trading_client, data_client = get_clients(cfg)
 
     # Check market hours (bypass with --now flag for testing)
-    if not market_open(trading_client) and not getattr(run_strategy, "_force", False):
+    # _force is checked first so market_open() is never called during forced runs
+    if not getattr(run_strategy, "_force", False) and not market_open(trading_client):
         log.info("Market is closed — skipping this cycle.")
         return
 
-    account = trading_client.get_account()
-    log.info(
-        f"Account | Equity: ${float(account.equity):,.2f} | "
-        f"Buying Power: ${float(account.buying_power):,.2f} | "
-        f"Mode: {'PAPER' if paper else 'LIVE'}"
-    )
+    try:
+        account = trading_client.get_account()
+        log.info(
+            f"Account | Equity: ${float(account.equity):,.2f} | "
+            f"Buying Power: ${float(account.buying_power):,.2f} | "
+            f"Mode: {'PAPER' if paper else 'LIVE'}"
+        )
+    except Exception as e:
+        log.warning(f"Cannot reach Alpaca account API ({e}) — running in signal-only (dry-run) mode")
+        account = None
 
     for symbol in watchlist:
         log.info(f"\n── {symbol} ──────────────────────────────")
@@ -303,22 +329,29 @@ def run_strategy(cfg):
         sell_sig = bool(latest["sell_signal"])
         log.info(f"  Signal | BUY: {buy_sig} | SELL: {sell_sig}")
 
-        # 3. Check current position
-        position = get_position(trading_client, symbol)
-        qty = float(position.qty) if position else 0.0
-        has_long = qty > 0   # only count actual long positions, not accidental shorts
-        log.info(
-            f"  Position: {'LONG ' + str(round(qty, 4)) + ' shares' if has_long else 'NONE'}"
-            + (" ⚠️ SHORT detected — skipping all trades" if qty < 0 else "")
-        )
+        # 3. Check current position (skip if no account access)
+        if account is None:
+            log.info("  Position: UNKNOWN (dry-run — Alpaca unreachable)")
+            position, qty, has_long = None, 0.0, False
+        else:
+            position = get_position(trading_client, symbol)
+            qty = float(position.qty) if position else 0.0
+            has_long = qty > 0
+            log.info(
+                f"  Position: {'LONG ' + str(round(qty, 4)) + ' shares' if has_long else 'NONE'}"
+                + (" ⚠️ SHORT detected — skipping all trades" if qty < 0 else "")
+            )
+            if qty < 0:
+                log.warning(f"  Short position detected on {symbol} — please close manually in Alpaca dashboard.")
+                continue
 
-        # Skip anything if we're accidentally short (manual cleanup needed)
-        if qty < 0:
-            log.warning(f"  Short position detected on {symbol} — please close manually in Alpaca dashboard.")
-            continue
-
-        # 4. Execute trades
-        if buy_sig and not has_long:
+        # 4. Execute trades (skip if account unreachable)
+        if account is None:
+            if buy_sig:
+                log.info(f"  [DRY-RUN] Would place BUY ${trade_amount:,.0f} — Alpaca unreachable")
+            elif sell_sig:
+                log.info(f"  [DRY-RUN] Would place SELL ${trade_amount:,.0f} — Alpaca unreachable")
+        elif buy_sig and not has_long:
             # Verify we have buying power
             if float(account.buying_power) >= trade_amount:
                 log.info(f"  🟢 BUY signal confirmed — placing ${trade_amount:,.0f} order")
