@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import yfinance as yf
 from apscheduler.schedulers.blocking import BlockingScheduler
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
@@ -176,12 +177,9 @@ def get_clients(cfg):
     return trading, data
 
 
-def fetch_bars(data_client, symbol: str, bars: int = BARS_NEEDED) -> pd.DataFrame:
-    """Fetch 1H bars via IEX and resample to 4H.
-    IEX free feed doesn't reliably serve 4H bars natively, so we
-    build them ourselves from hourly data."""
+def _fetch_bars_alpaca(data_client, symbol: str, bars: int) -> pd.DataFrame:
+    """Fetch 1H bars via Alpaca IEX and resample to 4H."""
     end   = datetime.now(timezone.utc)
-    # 1H bars needed: bars * 4H each, market open ~6.5H/day → generous buffer
     start = end - timedelta(days=int(bars * 4 / 6.5) + 45)
 
     req = StockBarsRequest(
@@ -197,7 +195,6 @@ def fetch_bars(data_client, symbol: str, bars: int = BARS_NEEDED) -> pd.DataFram
     if df.empty:
         return df
 
-    # Flatten multi-index if present
     if isinstance(df.index, pd.MultiIndex):
         df = df.xs(symbol, level="symbol")
 
@@ -205,7 +202,6 @@ def fetch_bars(data_client, symbol: str, bars: int = BARS_NEEDED) -> pd.DataFram
     df.index = pd.to_datetime(df.index, utc=True)
     df.sort_index(inplace=True)
 
-    # Resample 1H → 4H
     df_4h = df.resample("4h").agg({
         "open":   "first",
         "high":   "max",
@@ -215,6 +211,48 @@ def fetch_bars(data_client, symbol: str, bars: int = BARS_NEEDED) -> pd.DataFram
     }).dropna(subset=["close"])
 
     return df_4h.tail(bars)
+
+
+def _fetch_bars_yfinance(symbol: str, bars: int) -> pd.DataFrame:
+    """Fallback: fetch 1H bars via yfinance and resample to 4H.
+    yfinance free tier supports up to 730 days of 1H history."""
+    days_needed = min(int(bars * 4 / 6.5) + 45, 720)
+    end   = datetime.now(timezone.utc)
+    start = end - timedelta(days=days_needed)
+
+    ticker = yf.Ticker(symbol)
+    df = ticker.history(start=start.strftime("%Y-%m-%d"),
+                        end=end.strftime("%Y-%m-%d"),
+                        interval="1h",
+                        auto_adjust=True)
+    if df.empty:
+        return df
+
+    df.columns = [c.lower() for c in df.columns]
+    df = df[["open", "high", "low", "close", "volume"]].copy()
+    df.index = pd.to_datetime(df.index, utc=True)
+    df.sort_index(inplace=True)
+
+    df_4h = df.resample("4h").agg({
+        "open":   "first",
+        "high":   "max",
+        "low":    "min",
+        "close":  "last",
+        "volume": "sum",
+    }).dropna(subset=["close"])
+
+    return df_4h.tail(bars)
+
+
+def fetch_bars(data_client, symbol: str, bars: int = BARS_NEEDED) -> pd.DataFrame:
+    """Fetch 4H bars for symbol.  Tries Alpaca first, falls back to yfinance."""
+    try:
+        df = _fetch_bars_alpaca(data_client, symbol, bars)
+        if not df.empty:
+            return df
+    except Exception as exc:
+        log.debug(f"  Alpaca data unavailable for {symbol} ({exc}), using yfinance fallback")
+    return _fetch_bars_yfinance(symbol, bars)
 
 
 def get_position(trading_client, symbol: str):
@@ -256,6 +294,8 @@ def run_strategy(cfg):
     log.info(f"TDI Strategy cycle — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info("=" * 60)
 
+    run_strategy._results = []
+
     watchlist    = cfg.get("watchlist", ["SPY"])
     trade_amount = float(cfg.get("trade_amount", 500))
     paper        = cfg.get("paper", True)
@@ -263,16 +303,21 @@ def run_strategy(cfg):
     trading_client, data_client = get_clients(cfg)
 
     # Check market hours (bypass with --now flag for testing)
-    if not market_open(trading_client) and not getattr(run_strategy, "_force", False):
+    # _force is checked first so market_open() is never called when forcing a run
+    if not getattr(run_strategy, "_force", False) and not market_open(trading_client):
         log.info("Market is closed — skipping this cycle.")
         return
 
-    account = trading_client.get_account()
-    log.info(
-        f"Account | Equity: ${float(account.equity):,.2f} | "
-        f"Buying Power: ${float(account.buying_power):,.2f} | "
-        f"Mode: {'PAPER' if paper else 'LIVE'}"
-    )
+    account = None
+    try:
+        account = trading_client.get_account()
+        log.info(
+            f"Account | Equity: ${float(account.equity):,.2f} | "
+            f"Buying Power: ${float(account.buying_power):,.2f} | "
+            f"Mode: {'PAPER' if paper else 'LIVE'}"
+        )
+    except Exception as exc:
+        log.warning(f"Could not fetch account info ({exc}). Signals will be computed but orders will be skipped.")
 
     for symbol in watchlist:
         log.info(f"\n── {symbol} ──────────────────────────────")
@@ -317,8 +362,10 @@ def run_strategy(cfg):
             log.warning(f"  Short position detected on {symbol} — please close manually in Alpaca dashboard.")
             continue
 
-        # 4. Execute trades
-        if buy_sig and not has_long:
+        # 4. Execute trades (skipped if account is inaccessible)
+        if account is None:
+            log.info(f"  Skipping order execution — trading API unavailable")
+        elif buy_sig and not has_long:
             # Verify we have buying power
             if float(account.buying_power) >= trade_amount:
                 log.info(f"  🟢 BUY signal confirmed — placing ${trade_amount:,.0f} order")
@@ -342,8 +389,32 @@ def run_strategy(cfg):
         else:
             log.info(f"  No signal — holding")
 
+        # Collect for summary table
+        run_strategy._results.append({
+            "symbol":   symbol,
+            "close":    round(latest["close"], 2),
+            "rsi":      round(latest["rsi"], 1),
+            "fast_ma":  round(latest["fast_ma"], 1),
+            "slow_ma":  round(latest["slow_ma"], 1),
+            "mid":      round(latest["mid"], 1),
+            "signal":   "BUY" if buy_sig else ("SELL" if sell_sig else "HOLD"),
+        })
         time.sleep(0.3)  # gentle rate limiting between symbols
 
+    # Print summary table
+    results = getattr(run_strategy, "_results", [])
+    if results:
+        header = f"\n{'Ticker':<8} {'Close':>8} {'RSI':>6} {'FastMA':>7} {'SlowMA':>7} {'Mid':>6}  {'Signal':<6}"
+        sep    = "-" * len(header)
+        log.info(sep)
+        log.info(header)
+        log.info(sep)
+        for r in results:
+            log.info(
+                f"{r['symbol']:<8} {r['close']:>8.2f} {r['rsi']:>6.1f} "
+                f"{r['fast_ma']:>7.1f} {r['slow_ma']:>7.1f} {r['mid']:>6.1f}  {r['signal']:<6}"
+            )
+        log.info(sep)
     log.info(f"\nCycle complete.\n")
 
 # ─────────────────────────────────────────────
