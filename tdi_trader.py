@@ -35,6 +35,12 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
+try:
+    import yfinance as yf
+    _YFINANCE_AVAILABLE = True
+except ImportError:
+    _YFINANCE_AVAILABLE = False
+
 # ─────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────
@@ -177,11 +183,24 @@ def get_clients(cfg):
 
 
 def fetch_bars(data_client, symbol: str, bars: int = BARS_NEEDED) -> pd.DataFrame:
-    """Fetch 1H bars via IEX and resample to 4H.
-    IEX free feed doesn't reliably serve 4H bars natively, so we
-    build them ourselves from hourly data."""
+    """Fetch 1H bars via Alpaca/IEX and resample to 4H.
+    Falls back to yfinance if the Alpaca data API is unavailable.
+    Returns an empty DataFrame if both sources fail."""
+    try:
+        return _fetch_bars_alpaca(data_client, symbol, bars)
+    except Exception as e:
+        log.warning(f"  Alpaca data unavailable for {symbol} ({e}) — trying yfinance fallback")
+
+    try:
+        return _fetch_bars_yfinance(symbol, bars)
+    except Exception as e:
+        log.warning(f"  yfinance also unavailable for {symbol} ({e}) — skipping")
+        return pd.DataFrame()
+
+
+def _fetch_bars_alpaca(data_client, symbol: str, bars: int) -> pd.DataFrame:
+    """Fetch via Alpaca IEX feed (primary path)."""
     end   = datetime.now(timezone.utc)
-    # 1H bars needed: bars * 4H each, market open ~6.5H/day → generous buffer
     start = end - timedelta(days=int(bars * 4 / 6.5) + 45)
 
     req = StockBarsRequest(
@@ -197,7 +216,6 @@ def fetch_bars(data_client, symbol: str, bars: int = BARS_NEEDED) -> pd.DataFram
     if df.empty:
         return df
 
-    # Flatten multi-index if present
     if isinstance(df.index, pd.MultiIndex):
         df = df.xs(symbol, level="symbol")
 
@@ -205,8 +223,32 @@ def fetch_bars(data_client, symbol: str, bars: int = BARS_NEEDED) -> pd.DataFram
     df.index = pd.to_datetime(df.index, utc=True)
     df.sort_index(inplace=True)
 
-    # Resample 1H → 4H
     df_4h = df.resample("4h").agg({
+        "open":   "first",
+        "high":   "max",
+        "low":    "min",
+        "close":  "last",
+        "volume": "sum",
+    }).dropna(subset=["close"])
+
+    return df_4h.tail(bars)
+
+
+def _fetch_bars_yfinance(symbol: str, bars: int) -> pd.DataFrame:
+    """Fetch via yfinance (fallback when Alpaca data is unavailable)."""
+    if not _YFINANCE_AVAILABLE:
+        raise RuntimeError("yfinance not installed; run: pip install yfinance")
+
+    tk = yf.Ticker(symbol)
+    df = tk.history(period="60d", interval="1h", auto_adjust=True)
+    if df.empty:
+        return df
+
+    df.columns = [c.lower() for c in df.columns]
+    df.index = pd.to_datetime(df.index, utc=True)
+    df.sort_index(inplace=True)
+
+    df_4h = df[["open", "high", "low", "close", "volume"]].resample("4h").agg({
         "open":   "first",
         "high":   "max",
         "low":    "min",
@@ -226,9 +268,16 @@ def get_position(trading_client, symbol: str):
 
 
 def market_open(trading_client) -> bool:
-    """Check if the US market is currently open."""
-    clock = trading_client.get_clock()
-    return clock.is_open
+    """Check if the US market is currently open.
+    Returns True (assume open) if the trading API is unreachable and --now is set."""
+    try:
+        clock = trading_client.get_clock()
+        return clock.is_open
+    except Exception as e:
+        if getattr(run_strategy, "_force", False):
+            log.warning(f"Could not reach Alpaca clock API ({e}) — assuming market open (--now override)")
+            return True
+        raise
 
 
 def place_order(trading_client, symbol: str, side: OrderSide, dollar_amount: float):
@@ -267,80 +316,75 @@ def run_strategy(cfg):
         log.info("Market is closed — skipping this cycle.")
         return
 
-    account = trading_client.get_account()
-    log.info(
-        f"Account | Equity: ${float(account.equity):,.2f} | "
-        f"Buying Power: ${float(account.buying_power):,.2f} | "
-        f"Mode: {'PAPER' if paper else 'LIVE'}"
-    )
+    # Attempt to load account info; degrade gracefully if trading API is blocked
+    account = None
+    trading_api_ok = True
+    try:
+        account = trading_client.get_account()
+        log.info(
+            f"Account | Equity: ${float(account.equity):,.2f} | "
+            f"Buying Power: ${float(account.buying_power):,.2f} | "
+            f"Mode: {'PAPER' if paper else 'LIVE'}"
+        )
+    except Exception as e:
+        trading_api_ok = False
+        log.warning(
+            f"Trading API unavailable ({e}) — signals will be computed but orders SKIPPED."
+        )
+
+    # ── Summary table header ──────────────────────────────────────
+    log.info("")
+    log.info(f"{'Ticker':<6} {'Price':>8} {'RSI':>6} {'FastMA':>7} {'SlowMA':>7} {'Mid':>6}  Signal    Order")
+    log.info("─" * 72)
 
     for symbol in watchlist:
-        log.info(f"\n── {symbol} ──────────────────────────────")
 
         # 1. Fetch bars
         df = fetch_bars(data_client, symbol)
         if df.empty or len(df) < BAND_LENGTH + RSI_PERIOD:
-            log.warning(f"  Not enough bars for {symbol} — skipping.")
+            log.warning(f"  {symbol:<6} — not enough bars, skipping.")
             continue
 
         # 2. Calculate TDI
         df = calculate_tdi(df)
         latest = df.iloc[-1]
 
-        log.info(
-            f"  Latest bar: {df.index[-1].strftime('%Y-%m-%d %H:%M UTC')} | "
-            f"Close: ${latest['close']:.2f}"
-        )
-        log.info(
-            f"  TDI | RSI: {latest['rsi']:.1f} | "
-            f"Mid: {latest['mid']:.1f} | "
-            f"FastMA: {latest['fast_ma']:.1f} | "
-            f"SlowMA: {latest['slow_ma']:.1f} | "
-            f"Upper: {latest['upper']:.1f} | Lower: {latest['lower']:.1f}"
-        )
-
         buy_sig  = bool(latest["buy_signal"])
         sell_sig = bool(latest["sell_signal"])
-        log.info(f"  Signal | BUY: {buy_sig} | SELL: {sell_sig}")
+        signal   = "BUY" if buy_sig else ("SELL" if sell_sig else "HOLD")
 
-        # 3. Check current position
-        position = get_position(trading_client, symbol)
-        qty = float(position.qty) if position else 0.0
-        has_long = qty > 0   # only count actual long positions, not accidental shorts
-        log.info(
-            f"  Position: {'LONG ' + str(round(qty, 4)) + ' shares' if has_long else 'NONE'}"
-            + (" ⚠️ SHORT detected — skipping all trades" if qty < 0 else "")
-        )
+        # 3. Check current position (best-effort)
+        position = get_position(trading_client, symbol) if trading_api_ok else None
+        qty      = float(position.qty) if position else 0.0
+        has_long = qty > 0
 
-        # Skip anything if we're accidentally short (manual cleanup needed)
-        if qty < 0:
-            log.warning(f"  Short position detected on {symbol} — please close manually in Alpaca dashboard.")
-            continue
-
-        # 4. Execute trades
-        if buy_sig and not has_long:
-            # Verify we have buying power
+        # 4. Determine order action
+        order_note = "—"
+        if not trading_api_ok:
+            order_note = f"WOULD {signal} ${trade_amount:,.0f}" if signal != "HOLD" else "—"
+        elif qty < 0:
+            order_note = "SHORT — skip (close manually)"
+        elif buy_sig and not has_long:
             if float(account.buying_power) >= trade_amount:
-                log.info(f"  🟢 BUY signal confirmed — placing ${trade_amount:,.0f} order")
                 place_order(trading_client, symbol, OrderSide.BUY, trade_amount)
+                order_note = f"BUY ${trade_amount:,.0f} placed"
             else:
-                log.warning(f"  Insufficient buying power (${float(account.buying_power):,.2f}) — skipping buy")
-
+                order_note = f"BUY skipped (low BP: ${float(account.buying_power):,.0f})"
         elif sell_sig and has_long:
-            # Don't sell more than we hold
-            pos_value = float(position.market_value)
+            pos_value     = float(position.market_value)
             sell_notional = min(trade_amount, pos_value)
-            log.info(f"  🔴 SELL signal confirmed — placing ${sell_notional:,.0f} order")
             place_order(trading_client, symbol, OrderSide.SELL, sell_notional)
-
+            order_note = f"SELL ${sell_notional:,.0f} placed"
         elif buy_sig and has_long:
-            log.info(f"  BUY signal but already have a position — holding")
-
+            order_note = "already long — hold"
         elif sell_sig and not has_long:
-            log.info(f"  SELL signal but no position to sell — skipping")
+            order_note = "no position — skip"
 
-        else:
-            log.info(f"  No signal — holding")
+        log.info(
+            f"{symbol:<6} {latest['close']:>8.2f} {latest['rsi']:>6.1f} "
+            f"{latest['fast_ma']:>7.1f} {latest['slow_ma']:>7.1f} {latest['mid']:>6.1f}  "
+            f"{signal:<8}  {order_note}"
+        )
 
         time.sleep(0.3)  # gentle rate limiting between symbols
 
